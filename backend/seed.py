@@ -1,6 +1,6 @@
 import uuid
 
-from app.database import SessionLocal
+from backend.database import SessionLocal
 
 from app.models import User, Document, FormulaEntry
 
