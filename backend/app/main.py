@@ -1,6 +1,8 @@
 import fitz  # PyMuPDF
+import re
 import uuid
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -13,6 +15,19 @@ from .models import Base, FormulaEntry, Document
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Dependency để lấy DB Session cho mỗi request
 def get_db():
@@ -27,10 +42,30 @@ class FormulaSaveRequest(BaseModel):
     document_id: uuid.UUID
     latex_content: str
 
+
+def extract_latex_candidate(raw_text: str) -> str:
+    """
+    Chọn một dòng có vẻ là công thức toán từ text trích xuất PDF.
+    Nếu không tìm thấy, trả về dòng không rỗng đầu tiên để người dùng có thể chỉnh sửa tiếp.
+    """
+    if not raw_text:
+        return ""
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    math_like_pattern = re.compile(r"[=+\-*/^_\\]|\d")
+    for line in lines:
+        if math_like_pattern.search(line):
+            return line
+
+    return lines[0]
+
 # --- API Endpoints ---
 
 @app.post("/upload-pdf/")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     1. Nhận file PDF
     2. Dùng PyMuPDF trích xuất ảnh trang đầu (giả lập)
@@ -49,21 +84,30 @@ async def upload_pdf(file: UploadFile = File(...)):
         if len(doc) == 0:
             raise HTTPException(status_code=400, detail="File PDF trống.")
 
-        # Trích xuất trang đầu tiên
-        page = doc[0]
-        pix = page.get_pixmap()
-        
-        # Trong thực tế, bạn sẽ lưu pix.tobytes() vào storage (S3/Local) 
-        # và gửi qua model AI OCR. Ở đây ta giả lập kết quả OCR:
-        sample_latex = r"\int_{a}^{b} x^2 dx = \frac{b^3 - a^3}{3}"
-        
+        # Trích xuất text toàn bộ PDF, sau đó chọn dòng ứng viên công thức.
+        extracted_text = "\n".join(page.get_text("text") for page in doc)
+        extracted_latex = extract_latex_candidate(extracted_text)
+
+        new_document = Document(
+            id=uuid.uuid4(),
+            user_id=None,
+            file_name=file.filename,
+            file_path_url=f"upload://{file.filename}",
+            status="Processed",
+        )
+
+        db.add(new_document)
+        db.commit()
+        db.refresh(new_document)
+
         doc.close()
 
         return {
+            "document_id": new_document.id,
             "file_name": file.filename,
             "status": "processed",
-            "ocr_result": sample_latex,
-            "info": "Đã trích xuất trang 1 và giả lập OCR thành công."
+            "ocr_result": extracted_latex,
+            "info": "Đã trích xuất nội dung PDF thành công."
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi xử lý file: {str(e)}")
